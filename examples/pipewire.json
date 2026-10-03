@@ -1,0 +1,6 @@
+{
+  "sampleRate": 48000,
+  "channels": 2,
+  "sampleFormat": "s16le",
+  "latency": "20ms"
+}

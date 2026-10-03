@@ -1,0 +1,20 @@
+{
+  "name": "audio-stream",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun run --watch src/server.ts",
+    "start:tls": "bun run scripts/start-tls.ts",
+    "dev:tls": "bun run --watch scripts/start-tls.ts",
+    "cert": "bash scripts/gen-cert.sh",
+    "check": "bunx tsc --noEmit",
+    "test": "bun run scripts/smoke.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}

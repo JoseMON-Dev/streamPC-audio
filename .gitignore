@@ -1,0 +1,7 @@
+node_modules/
+bun.lockb
+*.log
+.DS_Store
+certs/cert.pem
+certs/key.pem
+dist/

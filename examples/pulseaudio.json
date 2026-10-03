@@ -1,0 +1,7 @@
+{
+  "sampleRate": 44100,
+  "channels": 2,
+  "sampleFormat": "s16le",
+  "device": "@DEFAULT_MONITOR@",
+  "latencyMs": 20
+}

@@ -1,0 +1,12 @@
+[req]
+distinguished_name = dn
+x509_extensions = v3_req
+prompt = no
+
+[dn]
+CN = audio-stream
+
+[v3_req]
+subjectAltName = DNS:localhost,IP:127.0.0.1,DNS:pop-os-acer-nitro-jose,DNS:pop-os-acer-nitro-jose.local,IP:10.56.252.55,IP:10.0.3.1
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth

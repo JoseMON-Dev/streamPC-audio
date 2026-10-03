@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>Audio Stream</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { background: #0e0e10; }
+  body {
+    margin: 0; padding: 24px; font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+    color: #efeff1; min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  h1 { font-size: 22px; margin: 0 0 20px; }
+  .card {
+    background: #18181b; border: 1px solid #2d2d35; border-radius: 16px;
+    padding: 20px; width: 100%; max-width: 360px; margin-bottom: 16px;
+    contain: paint;
+  }
+  .row { display: flex; gap: 8px; margin-bottom: 12px; }
+  input[type=text] {
+    flex: 1; padding: 12px 14px; font-size: 15px; border-radius: 10px;
+    border: 1px solid #2d2d35; background: #0e0e10; color: #efeff1; outline: none;
+    font-variant-numeric: tabular-nums;
+  }
+  button {
+    padding: 12px 18px; font-size: 15px; font-weight: 600; border: none;
+    border-radius: 10px; background: #9147ff; color: white; cursor: pointer;
+    transition: transform 80ms ease, background-color 80ms ease;
+  }
+  button:active { transform: scale(0.97); }
+  button.secondary { background: #2d2d35; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status {
+    display: inline-block; padding: 6px 12px; border-radius: 999px;
+    font-size: 13px; font-weight: 600;
+  }
+  .ok  { background: #1f4d2a; color: #7ee787; }
+  .bad { background: #4d1f1f; color: #ff7e7e; }
+  .pending { background: #4d4322; color: #ffe07e; }
+  label { display: block; font-size: 13px; color: #adadb8; margin: 12px 0 6px; }
+  input[type=range] { width: 100%; }
+  .meter {
+    height: 8px; background: #2d2d35; border-radius: 999px; overflow: hidden;
+    margin-top: 10px; contain: paint;
+  }
+  .meter > div {
+    height: 100%; width: 100%;
+    background: linear-gradient(90deg, #9147ff, #00ffaa);
+    transform-origin: left center;
+    transform: scaleX(0);
+    will-change: transform;
+  }
+  .small { font-size: 12px; color: #adadb8; margin-top: 8px; word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>Audio Stream</h1>
+
+<div class="card">
+  <div class="row">
+    <input id="host" type="text" placeholder="IP del PC (ej. 192.168.1.10)" inputmode="url">
+    <button id="btn-go">Ir</button>
+  </div>
+  <div>Estado: <span id="status" class="status bad">desconectado</span></div>
+
+  <label>Volumen</label>
+  <input id="vol" type="range" min="0" max="100" value="100">
+
+  <label>Nivel</label>
+  <div class="meter"><div id="meter"></div></div>
+  <div class="small" id="info">—</div>
+</div>
+
+<div class="card">
+  <button id="btn-start" class="secondary" style="width:100%">Iniciar reproducción</button>
+  <div class="small" id="warn" style="display:none;color:#ffb86b"></div>
+</div>
+
+<script>
+"use strict";
+
+// ============================================================================
+// Config del cliente: se ajusta con el primer mensaje 'hello' del server.
+// ============================================================================
+const SAMPLE_RATE = 44100;
+const CHANNELS    = 2;
+const GAIN_ID     = 0.92; // decay por frame del rAF del VU meter
+
+const hostEl   = document.getElementById("host");
+const statusEl = document.getElementById("status");
+const volEl    = document.getElementById("vol");
+const meterEl  = document.getElementById("meter");
+const infoEl   = document.getElementById("info");
+const warnEl   = document.getElementById("warn");
+const startBtn = document.getElementById("btn-start");
+const goBtn    = document.getElementById("btn-go");
+
+hostEl.value = location.hostname;
+
+let audioCtx  = null;
+let gainNode  = null;
+let player    = null;        // AudioWorkletNode
+let started   = false;
+let ws        = null;
+let reconnectAttempt = 0;
+let manualClose = false;
+let pingTimer = 0;
+let pendingPeak = 0;         // última peak normalizada (0..1) para meter
+
+function setStatus(state, txt) {
+  statusEl.textContent = txt;
+  statusEl.className = "status " + state;
+}
+
+function showError(msg) {
+  warnEl.textContent = msg;
+  warnEl.style.display = "block";
+  warnEl.style.color = "#ff7e7e";
+}
+
+function buildUrl() {
+  // La página puede estar servida por HTTP o HTTPS (LAN o vía túnel TLS).
+  // El esquema del WebSocket debe coincidir con el de la página o los
+  // navegadores modernos bloquean el intento (mixed content).
+  const h = (hostEl.value || location.hostname).trim();
+  const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${wsProto}//${h}:${location.port || "8080"}/ws`;
+}
+
+// ============================================================================
+// Inicialización de AudioContext + sink (worklet o fallback)
+//
+//   - Intenta cargar el AudioWorklet desde /pcm-sink.js.
+//   - Si falla (navegador viejo, contexto no seguro, …) cae automáticamente
+//     a ScriptProcessorNode, que también funciona en HTTP puro pero añade
+//     ~23 ms de latencia (FRAME = 1024 / 44.1 kHz).
+//
+// Ambos caminos comparten el mismo ring buffer Float32 (1 s) para que el
+// comportamiento de underrun/overflow sea idéntico.
+// ============================================================================
+function makeScriptProcessorSink(ctx, destination) {
+  const FRAME = 1024;                 // ~23 ms @ 44.1 kHz
+  const cap = SAMPLE_RATE;            // 1 s de ring
+  const left  = new Float32Array(cap);
+  const right = new Float32Array(cap);
+  let wIdx = 0, rIdx = 0, avail = 0;
+
+  const node = ctx.createScriptProcessor(FRAME, 0, CHANNELS);
+
+  node.onaudioprocess = (ev) => {
+    const oL = ev.outputBuffer.getChannelData(0);
+    const oR = ev.outputBuffer.getChannelData(1);
+    let written = 0;
+    while (written < FRAME && avail > 0) {
+      const intoEnd = left.length - rIdx;
+      const chunk = Math.min(FRAME - written, avail, intoEnd);
+      oL.set(left .subarray(rIdx, rIdx + chunk), written);
+      oR.set(right.subarray(rIdx, rIdx + chunk), written);
+      written += chunk;
+      rIdx = (rIdx + chunk) % left.length;
+      avail -= chunk;
+    }
+    while (written < FRAME) { oL[written] = 0; oR[written] = 0; written++; }
+  };
+  node.connect(destination);
+
+  return {
+    kind: "script-processor",
+    send(arrayBuffer, frames) {
+      const int16 = new Int16Array(arrayBuffer);
+      const n = frames | 0;
+      if (n <= 0) return;
+      let read = 0;
+      while (read < n) {
+        const freeSpace = left.length - avail;
+        if (freeSpace <= 0) {
+          // drop oldest
+          const drop = Math.min(left.length >> 2, n - read);
+          rIdx = (rIdx + drop) % left.length;
+          avail -= drop;
+          continue;
+        }
+        const intoEnd = left.length - wIdx;
+        const chunk = Math.min(n - read, freeSpace, intoEnd);
+        const off = read;
+        for (let i = 0; i < chunk; i++) {
+          left [wIdx + i] = int16[(off + i) * 2]     * 0.000030517578125;
+          right[wIdx + i] = int16[(off + i) * 2 + 1] * 0.000030517578125;
+        }
+        wIdx = (wIdx + chunk) % left.length;
+        avail += chunk;
+        read += chunk;
+      }
+    },
+  };
+}
+
+async function makeWorkletSink(ctx, destination) {
+  await ctx.audioWorklet.addModule("/pcm-sink.js");
+  const node = new AudioWorkletNode(ctx, "pcm-sink", {
+    outputChannelCount: [CHANNELS],
+    processorOptions: { capacityFrames: SAMPLE_RATE },
+  });
+  node.connect(destination);
+  return {
+    kind: "worklet",
+    send(arrayBuffer, frames) {
+      // El worklet decodifica y drena en su propio thread; le pasamos el buffer
+      // crudo con transfer (cero copias) — el original queda detached.
+      node.port.postMessage({ type: "pcm", buffer: arrayBuffer, frames }, [arrayBuffer]);
+    },
+  };
+}
+
+async function startAudio() {
+  if (started) return;
+  startBtn.textContent = "Iniciando...";
+  startBtn.disabled = true;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) throw new Error("AudioContext no soportado");
+
+    gainNode.gain.value = volEl.value / 100;
+    volEl.oninput = () => { gainNode.gain.value = volEl.value / 100; };
+
+    let usedWorklet = false;
+    if (audioCtx.audioWorklet) {
+      try {
+        player = await makeWorkletSink(audioCtx, gainNode);
+        usedWorklet = true;
+      } catch (e) {
+        console.warn("[audio] AudioWorklet no disponible, fallback ScriptProcessor:", (e && e.message) || e);
+        player = null;
+      }
+    }
+    if (!usedWorklet) {
+      player = makeScriptProcessorSink(audioCtx, gainNode);
+    }
+
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+
+    started = true;
+    startBtn.textContent = "Reproduciendo";
+    if (usedWorklet) {
+      warnEl.style.display = "none";
+    } else {
+      warnEl.textContent = "AudioWorklet no soportado / contexto no seguro; usando fallback ScriptProcessor (mayor latencia). Para recuperarlo, sirve el server por HTTPS.";
+      warnEl.style.display = "block";
+      warnEl.style.color = "#ffb86b";
+    }
+    infoEl.textContent = `sink: ${player.kind} @ ${SAMPLE_RATE}Hz ${CHANNELS}ch`;
+  } catch (err) {
+    started = false;
+    startBtn.disabled = false;
+    startBtn.textContent = "Reintentar";
+    showError("Error: " + (err && err.message ? err.message : err));
+    throw err;
+  }
+}
+
+// ============================================================================
+// WebSocket lifecycle + auto-reconnect con backoff exponencial + jitter
+// ============================================================================
+function scheduleReconnect() {
+  if (!started || manualClose) return;
+  const base = Math.min(30000, 500 * Math.pow(2, reconnectAttempt));
+  const jitter = Math.random() * 200;
+  const delay = base + jitter;
+  reconnectAttempt++;
+  setStatus("pending", `reconectando en ${(delay / 1000).toFixed(1)}s`);
+  setTimeout(() => { if (!manualClose) connect(); }, delay);
+}
+
+function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  manualClose = false;
+  const url = buildUrl();
+  const sock = new WebSocket(url);
+  sock.binaryType = "arraybuffer";
+  ws = sock;
+
+  sock.onopen = () => {
+    reconnectAttempt = 0;
+    setStatus("ok", "conectado");
+    clearInterval(pingTimer);
+    pingTimer = setInterval(() => {
+      if (sock.readyState === WebSocket.OPEN) {
+        try { sock.send(new Uint8Array(0)); } catch (_) { /* ignore */ }
+      }
+    }, 15000);
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+  };
+
+  sock.onclose = () => {
+    clearInterval(pingTimer);
+    if (ws === sock) ws = null;
+    if (manualClose || !started) {
+      setStatus("bad", "desconectado");
+    } else {
+      setStatus("bad", "desconectado");
+      scheduleReconnect();
+    }
+  };
+
+  sock.onerror = () => setStatus("bad", "error");
+
+  sock.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      infoEl.textContent = ev.data;
+      return;
+    }
+    if (!started || !player) return;
+
+    // 1 pasada por chunk SOLO para el VU meter (información visual,
+    // no decodifica audio). El audio va al sink como ArrayBuffer crudo.
+    const int16  = new Int16Array(ev.data);
+    const frames = (int16.length / CHANNELS) | 0;
+    let peak = 0;
+    for (let i = 0; i < frames; i++) {
+      const a = int16[i * 2];     const b = int16[i * 2 + 1];
+      const aa = a < 0 ? -a : a;  const bb = b < 0 ? -b : b;
+      if (aa > peak) peak = aa;
+      if (bb > peak) peak = bb;
+    }
+    pendingPeak = Math.max(pendingPeak, peak / 32768);
+
+    // El sink decide si usa transfer (worklet) o copia (fallback).
+    try {
+      player.send(ev.data, frames);
+    } catch (e) {
+      // Si el transfer falla, reintenta sin él.
+      try { player.send(ev.data, frames); } catch (_) { /* drop */ }
+    }
+  };
+}
+
+function disconnect() {
+  manualClose = true;
+  clearInterval(pingTimer);
+  if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+  setStatus("bad", "desconectado");
+}
+
+async function tryStart(e) {
+  if (e) e.preventDefault();
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) throw new Error("AudioContext no soportado");
+    audioCtx = new Ctx({
+      sampleRate: SAMPLE_RATE,    // mismo que el server → SO no resamplea
+      latencyHint: "interactive", // menor latencia posible
+    });
+    gainNode = audioCtx.createGain();
+    await startAudio();
+    connect();
+  } catch (_) { /* startAudio ya mostró el error en warnEl */ }
+}
+
+// ============================================================================
+// VU meter: vía requestAnimationFrame + transform (sin reflow)
+// ============================================================================
+function meterLoop() {
+  pendingPeak *= GAIN_ID;
+  meterEl.style.transform = `scaleX(${Math.min(1, pendingPeak * 1.4)})`;
+  requestAnimationFrame(meterLoop);
+}
+requestAnimationFrame(meterLoop);
+
+// ============================================================================
+// Listeners UI + reanudar audio al volver a la pestaña (móvil/iOS)
+// ============================================================================
+startBtn.addEventListener("click", tryStart);
+startBtn.addEventListener("touchend", tryStart);
+goBtn.addEventListener("click", (e) => {
+  if (e) e.preventDefault();
+  if (!started) { showError('Toca primero "Iniciar reproducción"'); return; }
+  disconnect();    // limpia la conexión previa si la hay
+  connect();
+});
+hostEl.addEventListener("keydown", (e) => { if (e.key === "Enter") goBtn.click(); });
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && audioCtx && audioCtx.state === "suspended") {
+    audioCtx.resume().catch(() => {});
+  }
+});
+
+// Exponer para debug (opcional)
+window.__audio__ = { get ctx() { return audioCtx; }, get ws() { return ws; } };
+</script>
+</body>
+</html>
